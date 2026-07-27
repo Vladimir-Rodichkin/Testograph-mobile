@@ -13,17 +13,50 @@ import random
 import toga
 import gistyc
 import textwrap
+import pathlib
 
-AUTH_TOKEN = ''
+_SECRETS_PATH = pathlib.Path(__file__).parent / 'secrets.local.json'
+try:
+    with open(_SECRETS_PATH, encoding='utf-8') as _f:
+        AUTH_TOKEN = json.load(_f).get('gist_auth_token', '')
+except FileNotFoundError:
+    AUTH_TOKEN = ''
+
+def safe_get_gists(auth_token, timeout=8):
+    # gistyc.GISTyc.get_gists() paginates until it gets an empty list back, but on
+    # an empty/invalid token GitHub returns a 401 error object (not a list), whose
+    # length is always > 0 - that spins the pagination loop forever and hangs the
+    # UI thread. Do the same request here with a status check and a timeout instead.
+    headers = {'Authorization': f'token {auth_token}'}
+    results = []
+    page = 1
+    while True:
+        try:
+            resp = requests.get(
+                f'https://api.github.com/gists?page={page}&per_page=100',
+                headers=headers,
+                timeout=timeout,
+            )
+        except requests.exceptions.RequestException:
+            return []
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+        if not data:
+            break
+        results.extend(data)
+        page += 1
+    return results
 
 class MyApp(toga.App):
     def tests(self):
         gist_api = gistyc.GISTyc(auth_token=AUTH_TOKEN)
-        bases = gist_api.get_gists()
+        bases = safe_get_gists(AUTH_TOKEN)
         for i in range(len(bases)):
             if 'tests.json' in bases[i]['files']:
                 tests = json.loads(requests.get(bases[i]['files']['tests.json']['raw_url']).text)
                 return tests['tests']
+        return []
     def startup(self):
         self.main_box = toga.Box(style=Pack(direction=COLUMN, padding=10))
         self.main_window = toga.MainWindow(title=self.formal_name)
@@ -32,7 +65,7 @@ class MyApp(toga.App):
         global user_confirmed
         try:
             gist_api = gistyc.GISTyc(auth_token=AUTH_TOKEN)
-            bases = gist_api.get_gists()
+            bases = safe_get_gists(AUTH_TOKEN)
             for i in range(len(bases)):
                 if 'users.json' in bases[i]['files']:
                     users = json.loads(requests.get(bases[i]['files']['users.json']['raw_url']).text)
@@ -99,7 +132,7 @@ class MyApp(toga.App):
         email = self.email_input.value
         password = self.password_input.value
         gist_api = gistyc.GISTyc(auth_token=AUTH_TOKEN)
-        bases = gist_api.get_gists()
+        bases = safe_get_gists(AUTH_TOKEN)
         for i in range(len(bases)):
             if 'users.json' in bases[i]['files']:
                 users = json.loads(requests.get(bases[i]['files']['users.json']['raw_url']).text)
@@ -135,7 +168,7 @@ class MyApp(toga.App):
         gist_api = gistyc.GISTyc(auth_token=AUTH_TOKEN)
         username = self.username_input.value
         password = self.password_input.value
-        bases = gist_api.get_gists()
+        bases = safe_get_gists(AUTH_TOKEN)
         for i in range(len(bases)):
             if 'users.json' in bases[i]['files']:
                 users = json.loads(requests.get(bases[i]['files']['users.json']['raw_url']).text)
@@ -178,12 +211,11 @@ class MyApp(toga.App):
             self.main_box.add(toga.Label(f'Аккаунт не проверен\nна подлиность', style=Pack(padding=(0, 5))))
         self.main_box.add(toga.Label('Выберите предмет', style=Pack(padding=(0, 5))))
         sub = ['rus' , 'mat' , 'phy']
+        sub_names = {'rus': 'Русский язык', 'mat': 'Математика', 'phy': 'Физика'}
         for i in sub:
-            image_path = f'sub_{i}.png'
-            icon = toga.Icon(image_path)
             button_sub = toga.Button(
+                text=sub_names[i],
                 on_press=partial(self.main_panel_sub, i),
-                icon=icon,
                 style=Pack(padding=5)
             )
 
@@ -361,7 +393,7 @@ class MyApp(toga.App):
             test_data["questions"].append(question_data)
 
         gist_api = gistyc.GISTyc(auth_token=AUTH_TOKEN)
-        bases = gist_api.get_gists()
+        bases = safe_get_gists(AUTH_TOKEN)
         for i in range(len(bases)):
             if 'checking_the_tests.json' in bases[i]['files']:
                 tests = json.loads(requests.get(bases[i]['files']['checking_the_tests.json']['raw_url']).text)
@@ -532,7 +564,7 @@ class MyApp(toga.App):
                             pil_image.thumbnail((200, 200))
                             self.question_box.add(toga.ImageView(image=pil_image))
                         else:
-                            image = toga.Image(f'image_sub\{question["image"]}.png')
+                            image = toga.Image(f'image_sub/{question["image"]}.png')
                             image_view = toga.ImageView(
                                 image=image,
                                 style=Pack(width=200, height=200, padding_bottom=5)
@@ -682,9 +714,16 @@ class MyApp(toga.App):
         for i in range(num_cols + 1):
             draw.line([(i * cell_width, 0), (i * cell_width, height)], fill='black', width=2)
 
-        # Создаем шрифт yeast.otf
+        # Создаем шрифт yeast.otf (если файла шрифта нет в ресурсах - берём системный шрифт
+        # с поддержкой кириллицы; PIL.ImageFont.load_default не умеет рисовать кириллицу)
         font_path = str(self.paths.app/"yeast.otf")
-        font = ImageFont.truetype(font_path, 15, 0 ,'utf-8')
+        try:
+            font = ImageFont.truetype(font_path, 15, 0 ,'utf-8')
+        except OSError:
+            try:
+                font = ImageFont.truetype('arial.ttf', 15)
+            except OSError:
+                font = ImageFont.load_default(size=15)
 
         # Добавляем текст в ячейки
         headings = list(data.keys())
@@ -871,7 +910,7 @@ class MyApp(toga.App):
         self.main_box.add(question_label)
         if question["imageUrl"] != 'empty':
             try:
-                image = toga.Image(f'image_sub\{question["imageUrl"]}.png')
+                image = toga.Image(f'image_sub/{question["imageUrl"]}.png')
                 image_view = toga.ImageView(
                     image=image,
                     style=Pack(width=200, height=200, padding_bottom=5)
